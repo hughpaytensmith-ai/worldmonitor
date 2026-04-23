@@ -653,6 +653,133 @@ function startTelegramPollLoop() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Telegram Bot API — long-polling command handler
+// Handles /start /help /status /feed /alerts from any chat
+// Activated when TELEGRAM_BOT_TOKEN is set (no webhook required)
+// ─────────────────────────────────────────────────────────────
+
+const BOT_TG_API = 'https://api.telegram.org';
+
+async function botSendMessage(chatId, text) {
+  if (!TELEGRAM_BOT_ENABLED) return;
+  try {
+    await fetch(`${BOT_TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'WorldMonitor-Relay/1.0' },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', disable_web_page_preview: true }),
+    });
+  } catch {}
+}
+
+async function botHandleCommand(chatId, command, args) {
+  switch (command) {
+    case '/start':
+      return botSendMessage(chatId, '*World Monitor Bot*\n\nReal-time global intelligence at your fingertips.\n\nType /help to see available commands.');
+
+    case '/help':
+      return botSendMessage(chatId,
+        '*Commands*\n\n' +
+        '/status — Relay health overview\n' +
+        '/feed — Latest early signals (e.g. `/feed conflict`)\n' +
+        '/alerts — Recent conflict signals from the feed\n' +
+        '/help — This message',
+      );
+
+    case '/status': {
+      const tg = telegramState;
+      const lines = [
+        '*Relay Status*',
+        '✅ Online',
+        TELEGRAM_ENABLED
+          ? `📡 Telegram OSINT: enabled (${tg.items?.length ?? 0} items)`
+          : '📡 Telegram OSINT: disabled',
+        TELEGRAM_BOT_ALERT_CHAT_IDS.length
+          ? `🔔 Alert chats: ${TELEGRAM_BOT_ALERT_CHAT_IDS.length} configured`
+          : '🔔 Alert chats: none configured',
+      ];
+      if (tg.lastPollAt) lines.push(`🕐 Last OSINT poll: ${new Date(tg.lastPollAt).toUTCString().replace(' GMT', ' UTC')}`);
+      return botSendMessage(chatId, lines.join('\n'));
+    }
+
+    case '/feed':
+    case '/alerts': {
+      const items = Array.isArray(telegramState.items) ? telegramState.items : [];
+      const topic = command === '/alerts' ? 'conflict' : (args[0] || '').toLowerCase();
+      const filtered = (topic ? items.filter(it => String(it.topic || '').toLowerCase() === topic) : items).slice(0, 5);
+      if (!filtered.length) {
+        return botSendMessage(chatId, topic ? `No recent signals for topic: _${topic}_` : 'No recent signals in feed.');
+      }
+      const header = command === '/alerts' ? '*Recent Conflict/Alert Signals*' : `*Recent Signals${topic ? ` — ${topic}` : ''}*`;
+      const lines = [header];
+      for (const item of filtered) {
+        const ch = item.channel ? `[${item.channel}] ` : '';
+        const body = (item.text || '').replace(/\*/g, '').replace(/_/g, '').slice(0, 160);
+        lines.push(`\n• ${ch}${body}`);
+      }
+      return botSendMessage(chatId, lines.join(''));
+    }
+
+    default:
+      break;
+  }
+}
+
+async function botProcessUpdate(update) {
+  const message = update?.message || update?.edited_message;
+  const text = message?.text?.trim();
+  const chatId = message?.chat?.id;
+  if (!text || !chatId) return;
+  const command = text.split(/\s+/)[0].replace(/@\w+$/, '').toLowerCase();
+  const args = text.split(/\s+/).slice(1);
+  if (command.startsWith('/')) {
+    await botHandleCommand(chatId, command, args);
+  }
+}
+
+let botPollOffset = 0;
+let botPollActive = false;
+
+async function startTelegramBotPollLoop() {
+  if (!TELEGRAM_BOT_ENABLED) return;
+  if (botPollActive) return;
+  botPollActive = true;
+  console.log('[Relay] Telegram Bot long-poll loop started');
+
+  while (botPollActive) {
+    try {
+      const res = await fetch(
+        `${BOT_TG_API}/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${botPollOffset}&timeout=25&allowed_updates=["message","edited_message"]`,
+        { signal: AbortSignal.timeout(35_000), headers: { 'User-Agent': 'WorldMonitor-Relay/1.0' } },
+      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        // 409 means another polling client is running (e.g. a webhook is set) — back off and stop
+        if (res.status === 409) {
+          console.warn('[Bot] getUpdates 409 Conflict — webhook may be set or another instance is polling. Stopping poll loop.');
+          botPollActive = false;
+          break;
+        }
+        console.warn(`[Bot] getUpdates HTTP ${res.status}: ${body.slice(0, 120)}`);
+        await new Promise(r => setTimeout(r, 5000));
+        continue;
+      }
+      const data = await res.json();
+      if (data.ok && Array.isArray(data.result)) {
+        for (const update of data.result) {
+          botPollOffset = update.update_id + 1;
+          botProcessUpdate(update).catch(() => {});
+        }
+      }
+    } catch (e) {
+      if (e?.name !== 'TimeoutError' && e?.name !== 'AbortError') {
+        console.warn('[Bot] getUpdates error:', e?.message || String(e));
+        await new Promise(r => setTimeout(r, 5000));
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // OREF Siren Alerts (Israel Home Front Command)
 // Polls oref.org.il via HTTP CONNECT tunnel through residential proxy (Israel exit)
 // ─────────────────────────────────────────────────────────────
@@ -7576,6 +7703,8 @@ const server = http.createServer(async (req, res) => {
       },
       telegramBot: {
         enabled: TELEGRAM_BOT_ENABLED,
+        polling: botPollActive,
+        pollOffset: botPollOffset,
         alertChatCount: TELEGRAM_BOT_ALERT_CHAT_IDS.length,
       },
       oref: {
@@ -8770,6 +8899,7 @@ const wss = new WebSocketServer({ server });
 server.listen(PORT, () => {
   console.log(`[Relay] WebSocket relay on port ${PORT} (OpenSky: ${OPENSKY_PROXY_ENABLED ? 'via proxy' : 'direct'})`);
   startTelegramPollLoop();
+  startTelegramBotPollLoop();
   startOrefPollLoop();
   startUcdpSeedLoop();
   startMarketDataSeedLoop();

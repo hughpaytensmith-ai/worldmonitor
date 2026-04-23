@@ -5,19 +5,22 @@ export const config = { runtime: 'edge' };
 
 const TG_API = 'https://api.telegram.org';
 
+const TG_MAX_TEXT = 4096;
+
 async function callBotApi(token, method, body) {
   const res = await fetch(`${TG_API}/bot${token}/${method}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'WorldMonitor-Bot/1.0' },
     body: JSON.stringify(body),
   });
+  if (!res.ok) console.warn(`[Bot] ${method} HTTP ${res.status}`);
   return res.ok;
 }
 
 function sendMessage(token, chatId, text, extra = {}) {
   return callBotApi(token, 'sendMessage', {
     chat_id: chatId,
-    text,
+    text: String(text).slice(0, TG_MAX_TEXT),
     parse_mode: 'Markdown',
     disable_web_page_preview: true,
     ...extra,

@@ -1,21 +1,22 @@
 #!/usr/bin/env node
 /**
- * Register (or inspect/delete) the Telegram Bot webhook URL.
+ * Telegram Bot setup: register webhook, commands, and bot profile.
  *
  * Prerequisites:
  *   TELEGRAM_BOT_TOKEN          — from BotFather
  *   TELEGRAM_BOT_WEBHOOK_SECRET — random string, also set in Vercel env
  *
- * Usage:
- *   # Set webhook (replace URL with your Vercel deployment)
- *   TELEGRAM_BOT_TOKEN=<token> TELEGRAM_BOT_WEBHOOK_SECRET=<secret> \
- *     node scripts/telegram/setup-bot-webhook.mjs set https://worldmonitor.app/api/telegram-bot-webhook
+ * Commands:
+ *   init                        — register bot commands in Telegram UI
+ *   set <url>                   — register webhook URL with Telegram
+ *   get                         — inspect current webhook info
+ *   delete                      — remove webhook (reverts to polling)
  *
- *   # Inspect current webhook
- *   TELEGRAM_BOT_TOKEN=<token> node scripts/telegram/setup-bot-webhook.mjs get
- *
- *   # Remove webhook (reverts to polling mode)
- *   TELEGRAM_BOT_TOKEN=<token> node scripts/telegram/setup-bot-webhook.mjs delete
+ * Full setup sequence (run after merging PR and deploying to Vercel):
+ *   export TELEGRAM_BOT_TOKEN=<token>
+ *   export TELEGRAM_BOT_WEBHOOK_SECRET=$(openssl rand -hex 32)
+ *   node scripts/telegram/setup-bot-webhook.mjs init
+ *   node scripts/telegram/setup-bot-webhook.mjs set https://<your-domain>/api/telegram-bot-webhook
  */
 
 const TG_API = 'https://api.telegram.org';
@@ -42,9 +43,27 @@ async function callApi(method, body) {
   return data.result;
 }
 
+const BOT_COMMANDS = [
+  { command: 'start',  description: 'Welcome message' },
+  { command: 'help',   description: 'List available commands' },
+  { command: 'status', description: 'Relay health overview' },
+  { command: 'feed',   description: 'Latest early signals (optional: /feed conflict)' },
+  { command: 'alerts', description: 'Recent conflict signals from the feed' },
+];
+
 const [, , command, webhookUrl] = process.argv;
 
 switch (command) {
+  case 'init': {
+    const cmdResult = await callApi('setMyCommands', { commands: BOT_COMMANDS });
+    console.log('✅ Bot commands registered:', cmdResult);
+    const descResult = await callApi('setMyDescription', {
+      description: 'Real-time global intelligence: conflict signals, market alerts, relay health — straight to Telegram.',
+    });
+    console.log('✅ Bot description set:', descResult);
+    break;
+  }
+
   case 'set': {
     if (!webhookUrl) {
       console.error('Usage: setup-bot-webhook.mjs set <https://your-domain/api/telegram-bot-webhook>');
@@ -76,8 +95,9 @@ switch (command) {
 
   default:
     console.log('Usage:');
+    console.log('  setup-bot-webhook.mjs init                — register bot commands + description');
     console.log('  setup-bot-webhook.mjs set <webhook-url>   — register webhook');
     console.log('  setup-bot-webhook.mjs get                 — inspect current webhook');
-    console.log('  setup-bot-webhook.mjs delete              — remove webhook');
+    console.log('  setup-bot-webhook.mjs delete              — remove webhook (reverts to polling)');
     process.exit(1);
 }

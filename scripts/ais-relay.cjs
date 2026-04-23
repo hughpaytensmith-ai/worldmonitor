@@ -745,6 +745,9 @@ async function startTelegramBotPollLoop() {
   botPollActive = true;
   console.log('[Relay] Telegram Bot long-poll loop started');
 
+  let backoffMs = 2000;
+  const maxBackoffMs = 60_000;
+
   while (botPollActive) {
     try {
       const res = await fetch(
@@ -753,16 +756,18 @@ async function startTelegramBotPollLoop() {
       );
       if (!res.ok) {
         const body = await res.text().catch(() => '');
-        // 409 means another polling client is running (e.g. a webhook is set) — back off and stop
         if (res.status === 409) {
-          console.warn('[Bot] getUpdates 409 Conflict — webhook may be set or another instance is polling. Stopping poll loop.');
+          // Webhook is active — Telegram forbids simultaneous polling. Stop permanently.
+          console.warn('[Bot] getUpdates 409 Conflict — webhook active or another instance polling. Polling disabled.');
           botPollActive = false;
           break;
         }
         console.warn(`[Bot] getUpdates HTTP ${res.status}: ${body.slice(0, 120)}`);
-        await new Promise(r => setTimeout(r, 5000));
+        await new Promise(r => setTimeout(r, backoffMs));
+        backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
         continue;
       }
+      backoffMs = 2000; // reset on success
       const data = await res.json();
       if (data.ok && Array.isArray(data.result)) {
         for (const update of data.result) {
@@ -773,7 +778,8 @@ async function startTelegramBotPollLoop() {
     } catch (e) {
       if (e?.name !== 'TimeoutError' && e?.name !== 'AbortError') {
         console.warn('[Bot] getUpdates error:', e?.message || String(e));
-        await new Promise(r => setTimeout(r, 5000));
+        await new Promise(r => setTimeout(r, backoffMs));
+        backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
       }
     }
   }

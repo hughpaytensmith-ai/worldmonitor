@@ -352,6 +352,33 @@ function sendPreGzipped(req, res, statusCode, headers, rawBody, gzippedBody, bro
 }
 
 // ─────────────────────────────────────────────────────────────
+// Telegram Bot API (HTTP, no MTProto) — sends notifications to chat IDs
+// Requires env: TELEGRAM_BOT_TOKEN, TELEGRAM_BOT_ALERT_CHAT_IDS (comma-separated)
+// ─────────────────────────────────────────────────────────────
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_BOT_ENABLED = !!TELEGRAM_BOT_TOKEN;
+const TELEGRAM_BOT_ALERT_CHAT_IDS = (process.env.TELEGRAM_BOT_ALERT_CHAT_IDS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+async function sendTelegramBotMessage(chatId, text) {
+  if (!TELEGRAM_BOT_ENABLED) return false;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'WorldMonitor-Relay/1.0' },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', disable_web_page_preview: true }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function broadcastBotAlert(text) {
+  if (!TELEGRAM_BOT_ENABLED || !TELEGRAM_BOT_ALERT_CHAT_IDS.length) return;
+  await Promise.allSettled(TELEGRAM_BOT_ALERT_CHAT_IDS.map(id => sendTelegramBotMessage(id, text)));
+}
+
 // Telegram OSINT ingestion (public channels) → Early Signals
 // Web-first: runs on this Railway relay process, serves /telegram/feed
 // Requires env:
@@ -7545,6 +7572,11 @@ const server = http.createServer(async (req, res) => {
         lastError: telegramState.lastError || null,
         pollInFlight: telegramPollInFlight,
         pollInFlightSince: telegramPollInFlight && telegramPollStartedAt ? new Date(telegramPollStartedAt).toISOString() : null,
+        itemCount: telegramState.items?.length || 0,
+      },
+      telegramBot: {
+        enabled: TELEGRAM_BOT_ENABLED,
+        alertChatCount: TELEGRAM_BOT_ALERT_CHAT_IDS.length,
       },
       oref: {
         enabled: OREF_ENABLED,
@@ -7696,6 +7728,43 @@ const server = http.createServer(async (req, res) => {
 
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(diag, null, 2));
+  } else if (pathname === '/telegram/bot/send') {
+    // Internal endpoint: send a message via the Telegram Bot API.
+    // Requires RELAY_SHARED_SECRET authentication and TELEGRAM_BOT_TOKEN.
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Method not allowed' }));
+    }
+    const relaySecret = process.env.RELAY_SHARED_SECRET || '';
+    const relayHeader = (process.env.RELAY_AUTH_HEADER || 'x-relay-key').toLowerCase();
+    const incomingSecret = req.headers[relayHeader] || req.headers['authorization']?.replace('Bearer ', '') || '';
+    if (relaySecret && incomingSecret !== relaySecret) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Unauthorized' }));
+    }
+    if (!TELEGRAM_BOT_ENABLED) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'TELEGRAM_BOT_TOKEN not configured' }));
+    }
+    try {
+      const bodyChunks = [];
+      await new Promise((resolve, reject) => {
+        req.on('data', chunk => bodyChunks.push(chunk));
+        req.on('end', resolve);
+        req.on('error', reject);
+      });
+      const { chat_id, text } = JSON.parse(Buffer.concat(bodyChunks).toString('utf8'));
+      if (!chat_id || !text) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'chat_id and text are required' }));
+      }
+      const ok = await sendTelegramBotMessage(String(chat_id), String(text).slice(0, 4096));
+      res.writeHead(ok ? 200 : 502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok }));
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid request body' }));
+    }
   } else if (pathname === '/telegram' || pathname.startsWith('/telegram/')) {
     // Telegram Early Signals feed (public channels)
     try {

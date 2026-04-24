@@ -653,74 +653,62 @@ function startTelegramPollLoop() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Telegram Bot API — long-polling command handler
-// Handles /start /help /status /feed /alerts from any chat
-// Activated when TELEGRAM_BOT_TOKEN is set (no webhook required)
+// Telegram Bot — Claude AI assistant bridge
+// Every message from any chat is forwarded to Claude API.
+// Conversation history is kept per chat ID for context.
+// Requires: TELEGRAM_BOT_TOKEN + ANTHROPIC_API_KEY
 // ─────────────────────────────────────────────────────────────
 
 const BOT_TG_API = 'https://api.telegram.org';
+const BOT_MAX_HISTORY = 20; // messages to keep per chat
+const BOT_SYSTEM_PROMPT = process.env.TELEGRAM_BOT_SYSTEM_PROMPT ||
+  'You are a helpful assistant. The user is talking to you via Telegram. Be concise.';
+
+// Per-chat conversation history: Map<chatId, [{role, content}]>
+const botChatHistory = new Map();
 
 async function botSendMessage(chatId, text) {
   if (!TELEGRAM_BOT_ENABLED) return;
   try {
     await fetch(`${BOT_TG_API}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'WorldMonitor-Relay/1.0' },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', disable_web_page_preview: true }),
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'TelegramBot/1.0' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: String(text).slice(0, 4096),
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+      }),
     });
   } catch {}
 }
 
-async function botHandleCommand(chatId, command, args) {
-  switch (command) {
-    case '/start':
-      return botSendMessage(chatId, '*World Monitor Bot*\n\nReal-time global intelligence at your fingertips.\n\nType /help to see available commands.');
+async function botAskClaude(chatId, userText) {
+  const history = botChatHistory.get(chatId) || [];
+  history.push({ role: 'user', content: userText });
 
-    case '/help':
-      return botSendMessage(chatId,
-        '*Commands*\n\n' +
-        '/status — Relay health overview\n' +
-        '/feed — Latest early signals (e.g. `/feed conflict`)\n' +
-        '/alerts — Recent conflict signals from the feed\n' +
-        '/help — This message',
-      );
+  try {
+    const { default: Anthropic } = await import('@anthropic-ai/sdk');
+    const client = new Anthropic({ apiKey: WIDGET_ANTHROPIC_KEY });
 
-    case '/status': {
-      const tg = telegramState;
-      const lines = [
-        '*Relay Status*',
-        '✅ Online',
-        TELEGRAM_ENABLED
-          ? `📡 Telegram OSINT: enabled (${tg.items?.length ?? 0} items)`
-          : '📡 Telegram OSINT: disabled',
-        TELEGRAM_BOT_ALERT_CHAT_IDS.length
-          ? `🔔 Alert chats: ${TELEGRAM_BOT_ALERT_CHAT_IDS.length} configured`
-          : '🔔 Alert chats: none configured',
-      ];
-      if (tg.lastPollAt) lines.push(`🕐 Last OSINT poll: ${new Date(tg.lastPollAt).toUTCString().replace(' GMT', ' UTC')}`);
-      return botSendMessage(chatId, lines.join('\n'));
-    }
+    const response = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1024,
+      system: BOT_SYSTEM_PROMPT,
+      messages: history.slice(-BOT_MAX_HISTORY),
+    });
 
-    case '/feed':
-    case '/alerts': {
-      const items = Array.isArray(telegramState.items) ? telegramState.items : [];
-      const topic = command === '/alerts' ? 'conflict' : (args[0] || '').toLowerCase();
-      const filtered = (topic ? items.filter(it => String(it.topic || '').toLowerCase() === topic) : items).slice(0, 5);
-      if (!filtered.length) {
-        return botSendMessage(chatId, topic ? `No recent signals for topic: _${topic}_` : 'No recent signals in feed.');
-      }
-      const header = command === '/alerts' ? '*Recent Conflict/Alert Signals*' : `*Recent Signals${topic ? ` — ${topic}` : ''}*`;
-      const lines = [header];
-      for (const item of filtered) {
-        const ch = item.channel ? `[${item.channel}] ` : '';
-        const body = (item.text || '').replace(/\*/g, '').replace(/_/g, '').slice(0, 160);
-        lines.push(`\n• ${ch}${body}`);
-      }
-      return botSendMessage(chatId, lines.join(''));
-    }
+    const reply = response.content?.[0]?.text || '(no response)';
+    history.push({ role: 'assistant', content: reply });
 
-    default:
-      break;
+    // Trim history to cap
+    if (history.length > BOT_MAX_HISTORY) history.splice(0, history.length - BOT_MAX_HISTORY);
+    botChatHistory.set(chatId, history);
+
+    return reply;
+  } catch (e) {
+    console.warn('[Bot] Claude API error:', e?.message || String(e));
+    return `⚠️ Error: ${e?.message || 'Claude API call failed'}`;
   }
 }
 
@@ -729,11 +717,17 @@ async function botProcessUpdate(update) {
   const text = message?.text?.trim();
   const chatId = message?.chat?.id;
   if (!text || !chatId) return;
-  const command = text.split(/\s+/)[0].replace(/@\w+$/, '').toLowerCase();
-  const args = text.split(/\s+/).slice(1);
-  if (command.startsWith('/')) {
-    await botHandleCommand(chatId, command, args);
+
+  if (text === '/start') {
+    return botSendMessage(chatId, 'Hello! Send me any message and I\'ll respond via Claude.');
   }
+  if (text === '/reset') {
+    botChatHistory.delete(chatId);
+    return botSendMessage(chatId, 'Conversation history cleared.');
+  }
+
+  const reply = await botAskClaude(chatId, text);
+  await botSendMessage(chatId, reply);
 }
 
 let botPollOffset = 0;
@@ -741,9 +735,13 @@ let botPollActive = false;
 
 async function startTelegramBotPollLoop() {
   if (!TELEGRAM_BOT_ENABLED) return;
+  if (!WIDGET_ANTHROPIC_KEY) {
+    console.warn('[Bot] ANTHROPIC_API_KEY not set — Telegram bot disabled');
+    return;
+  }
   if (botPollActive) return;
   botPollActive = true;
-  console.log('[Relay] Telegram Bot long-poll loop started');
+  console.log('[Bot] Telegram → Claude bridge started');
 
   let backoffMs = 2000;
   const maxBackoffMs = 60_000;
@@ -752,13 +750,12 @@ async function startTelegramBotPollLoop() {
     try {
       const res = await fetch(
         `${BOT_TG_API}/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${botPollOffset}&timeout=25&allowed_updates=["message","edited_message"]`,
-        { signal: AbortSignal.timeout(35_000), headers: { 'User-Agent': 'WorldMonitor-Relay/1.0' } },
+        { signal: AbortSignal.timeout(35_000), headers: { 'User-Agent': 'TelegramBot/1.0' } },
       );
       if (!res.ok) {
         const body = await res.text().catch(() => '');
         if (res.status === 409) {
-          // Webhook is active — Telegram forbids simultaneous polling. Stop permanently.
-          console.warn('[Bot] getUpdates 409 Conflict — webhook active or another instance polling. Polling disabled.');
+          console.warn('[Bot] 409 Conflict — webhook is active, stopping polling.');
           botPollActive = false;
           break;
         }
@@ -767,7 +764,7 @@ async function startTelegramBotPollLoop() {
         backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
         continue;
       }
-      backoffMs = 2000; // reset on success
+      backoffMs = 2000;
       const data = await res.json();
       if (data.ok && Array.isArray(data.result)) {
         for (const update of data.result) {

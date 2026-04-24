@@ -1,155 +1,124 @@
-# Telegram Bot Integration — Coworker Context
+# Telegram Bot Setup — Coworker Context
 
-## What this project is
+## What this is
 
-**WorldMonitor** (`hughpaytensmith-ai/worldmonitor`) is a real-time global intelligence dashboard.
-Key infrastructure:
-- **Vercel** — hosts the frontend SPA and stateless Edge API functions (`api/*.js`)
-- **Railway** — runs `scripts/ais-relay.cjs`, a persistent Node.js relay that handles live data (AIS vessels, Telegram OSINT, weather alerts, market data, etc.)
-- **Telegram OSINT** — the relay already reads public Telegram channels via MTProto (gramjs) and serves them at `/telegram/feed`. This is separate from the bot.
+A Telegram bot that bridges the user's Telegram account to the Claude AI API.
+The user sends any message to the bot on Telegram → Claude responds → reply comes back on Telegram.
 
----
-
-## What was built (all merged to `main`)
-
-A Telegram Bot API integration was added on top of the existing relay. Three files were created/modified:
-
-### 1. `api/telegram-bot-webhook.js` — Vercel Edge Function
-Receives POST webhook calls from Telegram. Handles commands:
-- `/start` — welcome message
-- `/help` — list commands
-- `/status` — relay health (calls relay `/metrics`)
-- `/feed [topic]` — latest OSINT signals (calls relay `/telegram/feed`)
-- `/alerts` — conflict signals (calls relay `/telegram/feed?topic=conflict`)
-
-Validates `X-Telegram-Bot-Api-Secret-Token` header against `TELEGRAM_BOT_WEBHOOK_SECRET` env var.
-Calls relay endpoints using existing `WS_RELAY_URL` + `RELAY_SHARED_SECRET`.
-
-### 2. `scripts/ais-relay.cjs` — additions to the Railway relay
-Three additions:
-- **`sendTelegramBotMessage(chatId, text)`** — sends a message via Bot API
-- **`broadcastBotAlert(text)`** — sends to all `TELEGRAM_BOT_ALERT_CHAT_IDS` (not yet wired to events)
-- **`startTelegramBotPollLoop()`** — long-polling fallback (for Railway/local). Uses `getUpdates` with 25s timeout, exponential backoff on errors (2s→60s), self-disables on 409 Conflict (when webhook is active)
-- **`POST /telegram/bot/send`** — internal HTTP endpoint (relay-auth protected) to trigger bot messages from anywhere in the system
-
-### 3. `scripts/telegram/setup-bot-webhook.mjs` — CLI setup script
-Run once from a machine with internet access:
-```
-node scripts/telegram/setup-bot-webhook.mjs init          # register commands + description in Telegram UI
-node scripts/telegram/setup-bot-webhook.mjs set <url>     # register webhook URL with Telegram
-node scripts/telegram/setup-bot-webhook.mjs get           # inspect current webhook
-node scripts/telegram/setup-bot-webhook.mjs delete        # remove webhook (reverts to polling)
-```
-
-### 4. `.env.example` — three new variables documented
-```
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_BOT_WEBHOOK_SECRET=
-TELEGRAM_BOT_ALERT_CHAT_IDS=
-```
+**This has nothing to do with the WorldMonitor dashboard.** It lives in this repo because
+the Railway relay (`scripts/ais-relay.cjs`) is the convenient always-on process to run it from,
+but the bot logic is completely self-contained.
 
 ---
 
-## Architecture: polling vs webhook
+## How it works
 
-**Current state:** The relay runs a long-polling loop (`getUpdates`) automatically when `TELEGRAM_BOT_TOKEN` is set. This works on Railway with zero extra setup but is single-instance only.
+```
+User → Telegram → [bot token] → Railway relay (long-polling) → Anthropic API → reply back
+                                        OR
+User → Telegram → [webhook]   → Vercel edge function          → Anthropic API → reply back
+```
 
-**Target state (production):** Webhook on Vercel. Telegram POSTs updates directly to `https://<domain>/api/telegram-bot-webhook`. Vercel is stateless and scales horizontally. When the webhook is registered, the relay's polling loop detects the 409 Conflict response and shuts itself down automatically — no manual change needed.
+Two modes — same end result:
+
+| Mode | Where | When to use |
+|---|---|---|
+| **Long-polling** (relay) | Railway `ais-relay.cjs` | Dev / Railway-only setups. Runs automatically when `TELEGRAM_BOT_TOKEN` + `ANTHROPIC_API_KEY` are set. Keeps conversation history in memory per chat. |
+| **Webhook** (Vercel) | `api/telegram-bot-webhook.js` | Production. Telegram pushes updates to Vercel. Stateless (no history). Relay polling auto-stops on 409 when webhook is active. |
 
 ---
 
-## Current state (as of this handoff)
+## Current state
 
-- ✅ Code merged to `main`
-- ✅ Vercel auto-deploying (check Vercel dashboard for completion)
-- ❌ `TELEGRAM_BOT_TOKEN` not set in Railway or Vercel
-- ❌ `TELEGRAM_BOT_WEBHOOK_SECRET` not set in Vercel
+- ✅ All code merged to `main`
+- ✅ Vercel auto-deployed
+- ❌ `TELEGRAM_BOT_TOKEN` not set anywhere
+- ❌ `ANTHROPIC_API_KEY` not set in Railway (already set in Vercel for widget builder — confirm)
 - ❌ Webhook not registered with Telegram
-- ❌ Bot commands not registered in Telegram UI (`/init` not run yet)
-- ⚠️ **Bot token must be rotated** — the token was shared in plain text during development and is compromised
+- ⚠️ **Original bot token is compromised** — was shared in plain text. Must rotate before use.
 
 ---
 
-## Exact steps to complete activation
+## Activation steps
 
-### Step 1 — Rotate the bot token (URGENT)
-The current token is compromised. Message [@BotFather](https://t.me/BotFather):
+### Step 1 — Rotate the bot token
+The token that was created was shared publicly and must be replaced.
+
+Message [@BotFather](https://t.me/BotFather) on Telegram:
 ```
 /mybots → select @Hughpaytensmith_bot → API Token → Revoke current token
 ```
-Copy the new token. Use it everywhere below.
+Copy the new token.
 
 ### Step 2 — Set Railway environment variables
-In the Railway dashboard for the relay service, add:
+In the Railway dashboard, add to the relay service:
 ```
-TELEGRAM_BOT_TOKEN=<new-token-from-step-1>
-TELEGRAM_BOT_ALERT_CHAT_IDS=<optional: comma-separated chat IDs for push alerts>
+TELEGRAM_BOT_TOKEN=<new-token>
+ANTHROPIC_API_KEY=<your-anthropic-key>
 ```
-Redeploy (or Railway auto-redeploys on env change). You'll see in logs:
-```
-[Relay] Telegram Bot long-poll loop started
-```
-The bot is now live via polling. Test it by messaging @Hughpaytensmith_bot with `/start`.
 
-### Step 3 — Set Vercel environment variables
-In Vercel dashboard → Project → Settings → Environment Variables:
+Optional — customise what Claude says:
 ```
-TELEGRAM_BOT_TOKEN=<same-new-token>
+TELEGRAM_BOT_SYSTEM_PROMPT=You are a helpful task manager. When given a task, acknowledge it and suggest next steps.
+```
+
+Redeploy. You'll see in Railway logs:
+```
+[Bot] Telegram → Claude bridge started
+```
+
+Test immediately: message [@Hughpaytensmith_bot](https://t.me/Hughpaytensmith_bot) with anything.
+Use `/reset` to clear conversation history.
+
+### Step 3 — Switch to production webhook (optional but recommended)
+
+**3a. Set Vercel environment variables:**
+```
+TELEGRAM_BOT_TOKEN=<new-token>
+ANTHROPIC_API_KEY=<your-anthropic-key>
+TELEGRAM_BOT_SYSTEM_PROMPT=<optional>
 TELEGRAM_BOT_WEBHOOK_SECRET=<generate: openssl rand -hex 32>
 ```
-Note the secret — you'll need it in Step 4.
 
-### Step 4 — Register bot commands and switch to webhook
-Run from a local machine (needs internet access, `git pull` first):
+**3b. Register webhook and bot commands** (run from local machine — needs internet):
 ```bash
-cd worldmonitor
 export TELEGRAM_BOT_TOKEN=<new-token>
-export TELEGRAM_BOT_WEBHOOK_SECRET=<same-secret-as-vercel>
+export TELEGRAM_BOT_WEBHOOK_SECRET=<same-value-as-vercel>
 
-# Register commands so they appear in Telegram's "/" picker
+# Register commands in Telegram UI (shows up in / picker)
 node scripts/telegram/setup-bot-webhook.mjs init
 
-# Register the webhook (use your actual Vercel URL)
+# Register webhook URL (use your actual Vercel domain)
 node scripts/telegram/setup-bot-webhook.mjs set https://<your-vercel-domain>/api/telegram-bot-webhook
 
-# Verify
+# Verify it's registered
 node scripts/telegram/setup-bot-webhook.mjs get
 ```
-After this, the relay's polling loop stops itself automatically and all traffic goes through Vercel.
 
-### Step 5 — Optional: set bot profile via BotFather
-```
-/mybots → @Hughpaytensmith_bot → Edit Bot → Edit Description / Edit About / Edit Botpic
-```
+After this, Railway polling stops itself automatically (409 Conflict). Vercel handles everything.
 
 ---
 
-## Environment variable reference
+## Environment variables
 
-| Variable | Where | Purpose |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | Railway + Vercel | Bot API token from BotFather |
-| `TELEGRAM_BOT_WEBHOOK_SECRET` | Vercel only | Random string; Telegram sends it in `X-Telegram-Bot-Api-Secret-Token` header to authenticate webhook calls |
-| `TELEGRAM_BOT_ALERT_CHAT_IDS` | Railway only | Comma-separated chat IDs to receive push alerts from relay events |
-
-## Existing variables (already set, do not change)
-| Variable | Purpose |
-|---|---|
-| `WS_RELAY_URL` | Vercel → Railway relay URL; webhook handler uses this to fetch feed/status data |
-| `RELAY_SHARED_SECRET` | Auth between Vercel and Railway relay |
-| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` / `TELEGRAM_SESSION` | MTProto OSINT (separate from bot — reads public channels) |
+| Variable | Railway | Vercel | Purpose |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | ✅ required | ✅ required | Bot token from BotFather |
+| `ANTHROPIC_API_KEY` | ✅ required | ✅ required | Calls Claude API |
+| `TELEGRAM_BOT_SYSTEM_PROMPT` | optional | optional | Claude's personality/instructions |
+| `TELEGRAM_BOT_WEBHOOK_SECRET` | not needed | ✅ required | Authenticates Telegram webhook calls |
+| `TELEGRAM_BOT_ALERT_CHAT_IDS` | optional | not used | Push alerts from relay events |
 
 ---
 
-## Key file locations
+## Key files
 
 ```
-api/telegram-bot-webhook.js              — Vercel webhook handler
-scripts/ais-relay.cjs                    — Railway relay (search: "Telegram Bot API")
-scripts/telegram/setup-bot-webhook.mjs  — setup CLI
-scripts/telegram/session-auth.mjs       — existing MTProto session tool (unrelated)
-.env.example                             — all env vars documented
+api/telegram-bot-webhook.js              — Vercel webhook handler (stateless, calls Claude)
+scripts/ais-relay.cjs                    — Railway relay (search: "Telegram Bot — Claude AI bridge")
+scripts/telegram/setup-bot-webhook.mjs  — CLI: init / set / get / delete
+.env.example                             — all variables documented
 ```
 
-## Bot username
+## Bot
 [@Hughpaytensmith_bot](https://t.me/Hughpaytensmith_bot)
